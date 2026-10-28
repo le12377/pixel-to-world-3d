@@ -1,6 +1,6 @@
 # 三维坐标转换与 ROS TF 使用说明
 
-本文是 [二维检测框测距教程](../README.md) 的后续说明，介绍获得深度或相对三维坐标后，如何得到世界坐标并运行 ROS 演示。
+本文是 [两种二维检测框测距方法](../README.md) 的后续说明，介绍获得深度或相对三维坐标后，如何得到世界坐标并运行 ROS 演示。框高相机模型法与框宽实测反比法的推导、标定及精度比较统一放在首页。
 
 参考脚本为 [tf_fransform_frame.py](../reference/tf_fransform_frame.py)。它接收上游计算好的 `box_x / box_y / box_z`，不执行二维检测框测距，也没有使用 `center_x / center_y` 进行反投影。
 
@@ -72,7 +72,7 @@ $$
 \begin{bmatrix}a\\b\\1\end{bmatrix}
 $$
 
-单目 YOLO 只给出检测框和类别，不直接提供米制深度。若目标真实宽度 `W` 已知、目标平面近似正对相机，可用 `Zc ≈ fx × W / w_pixel` 估计光轴深度；物体倾斜、遮挡、检测框误差都会影响精度。原脚本中的 `distance` 只被读取和打印，没有参与坐标计算，因此该字段本身不能补齐像素到三维的过程。
+单目 YOLO 只给出检测框和类别，不直接提供米制深度。可按首页的 [方法一](../README.md#camera-model)，用已知真实高度计算 `Zc ≈ fy × H / h`；也可按 [方法二](../README.md#empirical-calibration)，使用实测标定的系数计算 `Zc ≈ k / w`。两者都需要满足对应的目标尺寸与成像条件。物体倾斜、遮挡、检测框误差都会影响精度。原脚本中的 `distance` 只被读取和打印，没有参与坐标计算，因此该字段本身不能补齐像素到三维的过程。
 
 ## 3. 第二步：相机坐标 → 机体坐标
 
@@ -305,7 +305,7 @@ rosrun tf tf_echo world target_final
 
 ```text
 pixel-to-world-3d/
-├── README.md                         # 二维框测距公式、系数标定与误差
+├── README.md                         # 两种二维测距方法、标定与精度比较
 ├── docs/
 │   └── coordinate-transforms.md       # 三维坐标转换与 ROS 演示
 └── reference/
