@@ -1,442 +1,210 @@
-# 二维像素坐标转三维世界坐标：重点理解高度 h 的计算
+# 从二维检测框估算目标距离：单目测距与三维坐标转换
 
-以 [tf_fransform_frame.py](reference/tf_fransform_frame.py) 为参考，说明如何把图像中的目标中心 `(u, v)`，结合深度、相机标定和机器人位姿，转换成三维世界坐标，并在 ROS 中广播 TF、发布目标点。
+**本文重点：如何根据二维检测框的像素宽度或高度，计算相机到目标的距离估计。** 核心是同一个目标“近大远小”的透视关系，以及如何标定比例系数。
 
-**二维像素本身不能唯一确定三维位置，还需要深度或其他几何约束。** 参考脚本实现的是流程后半段：接收上游已经计算好的 `box_x / box_y / box_z`，结合里程计得到世界坐标。它虽然读取 `center_x / center_y`，但没有使用像素坐标进行反投影。
+已核对配套检测代码 `v888_drone_frame.py`：当前实现使用检测框宽度 `x2 - x1`，计算 `distance = (4000 / 2.86) / (x2 - x1)`。[tf_fransform_frame.py](reference/tf_fransform_frame.py) 则接收上游已经算好的相对三维坐标，完成后续世界坐标转换；它本身不执行二维测距。
 
-本文首先说明**高度 `h` 如何从图像纵坐标算出、如何叠加机器人高度，以及如何对应原脚本的 `box_z` 正负号**，再展开完整三维转换和 ROS1 演示。参考脚本按原样保留，文中明确区分数学模型、演示假设与原代码行为。
+## 核心：二维检测框怎样算出距离？
 
-## 核心：高度 h 到底怎么算？
+### 1. 从检测框中取像素尺寸
 
-### 先分清各个高度量
-
-原脚本没有名为 `h` 的变量。本文把**目标中心在世界坐标系中的 Z 坐标**记为 `h`，对应 `target_world_z`；它不等同于距地面的高度，除非世界坐标零高度恰好就是地面。
-
-| 符号 | 含义 | 对应关系 |
-| --- | --- | --- |
-| `H` | 无人机当前的世界高度 | 里程计的 `position.z`，即 `drone_world_z` |
-| `Δh` | 目标中心相对无人机原点的高度差，向上为正 | 与原脚本兼容时，`box_z = -Δh` |
-| `h` | 目标中心的世界高度 | `h = H + Δh` |
-| `h_goal` | 最终发布目标点的世界高度 | 原脚本中为 `h + 1.3` |
-
-这些高度量单位均为米。图像纵坐标 `v` 的单位是像素，需要经过相机模型与深度才能得到高度差。
-
-### 从纵向像素偏移得到高度差
-
-先采用一个清楚的几何条件：**相机水平朝前、无人机保持水平、图像已经去畸变，已知光轴深度 `Zc`**。令 `t_z` 表示相机光心相对无人机原点的竖直安装偏移，向上为正。
-
-图像中向下为正，因此相机光学坐标中的竖直分量为：
-
-$$
-Y_c = \frac{v-c_y}{f_y} Z_c
-$$
-
-转换到向上为正的高度差时取负号，再加上相机安装高度：
-
-$$
-\Delta h = t_z - Y_c = t_z + \frac{c_y-v}{f_y} Z_c
-$$
-
-最后叠加无人机当前高度，得到本文最关键的公式：
-
-$$
-\boxed{h = H + t_z + \frac{c_y-v}{f_y} Z_c}
-$$
-
-`cy` 是标定得到的主点纵坐标，不应直接用图像高度的一半替代；`fy` 是以像素为单位的纵向焦距。**同样的纵向像素偏移，目标越远，对应的实际高度差越大。**
-
-```mermaid
-flowchart TD
-    A["纵向像素偏移 cy - v"] --> B["除以 fy，再乘光轴深度 Zc"]
-    B --> C["加相机安装高度 t_z，得到向上为正的 Δh"]
-    C --> D["加无人机世界高度 H，得到目标高度 h"]
-    D --> E["按原脚本加 1.3 m，得到发布高度 h_goal"]
-```
-
-### 对应原脚本：为什么这里是减去 box_z？
-
-原脚本分两步完成高度计算：
+YOLO 输出目标框的左上角 `(x1, y1)` 和右下角 `(x2, y2)`：
 
 ```python
-# calculate_target_world_position()：计算检测目标本身的高度。
-world_z = self.drone_world_z - box_z
-
-# publish_goal()：在目标高度上增加固定的控制偏移。
-goal_msg.pose.position.z = self.target_world_z + self.z_offset
+w_pixel = x2 - x1       # 检测框的像素宽度。
+h_pixel = y2 - y1       # 检测框的像素高度。
+center_x = (x1 + x2) / 2
+center_y = (y1 + y2) / 2
 ```
 
-其中 `z_offset = 1.3`。若上游高度差采用向上为正的 `Δh`，就需要按当前脚本的输入约定传入 `box_z = -Δh`，于是：
-
-$$
-h = H - box_z = H + \Delta h,\qquad h_{goal} = H - box_z + 1.3
-$$
-
-**`1.3 m` 是目标发布时额外增加的高度偏移，不是从图像计算出的高度差，也不是相机安装高度 `t_z`。** 如果安装偏移已经包含在上游生成的 `box_z` 中，就不应再次叠加。
-
-仅改变 yaw 不会改变该脚本算出的 `h`：它只在 XY 平面做偏航旋转，高度单独通过 `H - box_z` 计算。原脚本不会根据 `center_y`、`distance` 或 `pitch_angle` 再计算一次高度。
-
-### 数值例子：目标在图像上方、中央、下方时
-
-设 `H = 1.5 m`、`Zc = 2.0 m`、`fy = 600 px`、`cy = 240 px`，相机安装偏移 `t_z = 0`：
-
-| 目标纵坐标 v | 纵向位置 | Δh（向上为正） | 输入 box_z | 目标高度 h | 发布高度 h_goal |
-| --- | --- | --- | --- | --- | --- |
-| `180 px` | 主点上方 | `+0.2 m` | `-0.2 m` | `1.7 m` | `3.0 m` |
-| `240 px` | 主点处 | `0 m` | `0 m` | `1.5 m` | `2.8 m` |
-| `300 px` | 主点下方 | `-0.2 m` | `+0.2 m` | `1.3 m` | `2.6 m` |
-
-以下代码可以独立运行，与后文完整三维例子一致：
-
-```python
-H, Zc, fy, cy = 1.5, 2.0, 600.0, 240.0
-v = 300.0
-camera_offset_z = 0.0
-
-delta_h = camera_offset_z + (cy - v) * Zc / fy
-box_z = -delta_h              # 适配原脚本的输入符号。
-h = H - box_z                # 检测到的目标高度。
-h_goal = h + 1.3             # 加固定偏移后的发布高度。
-
-print(f"高度差 Δh = {delta_h:.2f} m")
-print(f"目标高度 h = {h:.2f} m")
-print(f"发布高度 h_goal = {h_goal:.2f} m")
-```
-
-输出为 `Δh = -0.20 m`、`h = 1.30 m`、`h_goal = 2.60 m`。若其他条件不变，相机光心实际高于机体原点 `0.04 m`，则令 `camera_offset_z = 0.04`，目标高度变为 `1.34 m`。
-
-### 使用 pitch 和 distance 时，先确认距离的定义
-
-如果 `r` 是相机到目标的直线距离、`θ` 是相对水平面的真实仰角，则水平机体条件下可写为 `Δh = t_z + r × sin(θ)`。这里的 `θ` 是目标视线的仰角，不是无人机自身的俯仰姿态。
-
-若只有像素坐标与直线距离，令 `a = (u-cx)/fx`、`b = (v-cy)/fy`，则：
-
-$$
-\Delta h = t_z - \frac{r b}{\sqrt{1+a^2+b^2}}
-$$
-
-与之对应的真实仰角是 `atan2(-b, sqrt(1+a²))`。常见的 `-atan(b)` 只在 `u = cx` 时与这个仰角一致；明显偏离水平主点时，不能直接把它与直线距离搭配使用。若距离实际是光轴深度 `Zc`，则应回到 `Δh = t_z - b × Zc`。
-
-例如，上游若计算 `box_z = distance × sin(pitch) + 0.04`，并把它定义为向上为正的高度差，就不能未经符号转换直接传给当前使用减法的脚本。
-
-相机存在安装倾角、无人机存在明显 roll/pitch 时，应使用后文的完整旋转矩阵。通用高度公式为：
-
-$$
-h = H + \begin{bmatrix}0 & 0 & 1\end{bmatrix}
-R_{wb}\left(R_{bc}\mathbf{p}_c+\mathbf{t}_{bc}\right)
-$$
-
-这时相机坐标的多个分量都会影响世界高度，不能只对图像纵坐标单独缩放。
-
-## 1. 完整流程
-
-```mermaid
-flowchart TD
-    A[检测目标中心 u, v] --> C[像素反投影]
-    B[相机内参和目标深度] --> C
-    C --> D[相机光学坐标 Xc, Yc, Zc]
-    D --> E[相机外参：旋转和平移]
-    E --> F[机体坐标 Xb, Yb, Zb]
-    F --> G[机器人位姿：旋转和平移]
-    G --> H[世界坐标 Xw, Yw, Zw]
-    H --> I[可视化 TF 或生成目标点]
-```
-
-参考脚本不包含相机驱动、目标检测、深度估计或相机外参标定；这些数据需要由上游提供。
-
-## 2. 第一步：像素坐标 → 相机三维坐标
-
-### 2.1 相机内参和深度
-
-针孔相机内参为：
-
-$$
-K = \begin{bmatrix}
-f_x & 0 & c_x \\
-0 & f_y & c_y \\
-0 & 0 & 1
-\end{bmatrix}
-$$
+**框尺寸用于估算远近；框中心用于估算视线方向。** 两者作用不同，当前测距函数没有使用 `center_x`、`center_y`。
 
 | 符号 | 含义 | 单位 |
 | --- | --- | --- |
-| `u, v` | 目标中心在当前图像中的横、纵坐标 | 像素 |
-| `fx, fy` | 横、纵方向焦距 | 像素 |
-| `cx, cy` | 主点坐标 | 像素 |
-| `Zc` | 目标沿相机光轴的深度 | 米 |
+| `w_pixel` | 检测框宽度 `x2 - x1` | 像素 |
+| `h_pixel` | 检测框高度 `y2 - y1`；若简称 `h`，这里指图像中的像素高度 | 像素 |
+| `W_real / H_real` | 目标的真实宽度 / 真实高度 | 米 |
+| `fx / fy` | 相机横向 / 纵向焦距 | 像素 |
+| `D` | 尺寸模型估计的距离，理想正对相机条件下对应光轴深度 | 米 |
+| `k` | 已标定的“距离 × 像素尺寸”系数 | 米·像素 |
 
-在已经去畸变、内参与当前图像分辨率匹配的前提下：
+### 2. 为什么能用“系数 ÷ 像素尺寸”？
 
-$$
-X_c = \frac{u-c_x}{f_x}Z_c,\qquad
-Y_c = \frac{v-c_y}{f_y}Z_c,\qquad
-Z_c = D(u,v)
-$$
-
-ROS 相机光学坐标系通常为 **X 向右、Y 向下、Z 向前**。目标中心在主点右侧时 `Xc > 0`，位于主点下方时 `Yc > 0`。
-
-实际接入需要注意：
-
-- 深度图必须与检测图像对齐，取同一像素对应的深度；毫米值先乘 `0.001` 转成米。
-- 使用与图像处理流程对应的内参。原始图像需要结合畸变参数；校正图像通常使用 `CameraInfo.P` 对应的内参。裁剪、缩放、letterbox 后，需要把检测点还原到标定图像，或同步更新内参。
-- 目标框中心可能落在背景或无效深度上；应检查深度是否为正且有限，可在目标有效区域内取中值。
-
-### 2.2 光轴深度与直线距离的区别
-
-上面的 `Zc` 是沿光轴的深度，不是相机到目标的欧氏距离。如果传感器给出沿该像素视线的直线距离 `r`，先令：
+在针孔相机模型中，若目标近似正对相机、用于测量的宽度两端具有相同光轴深度：
 
 $$
-a = \frac{u-c_x}{f_x},\qquad b = \frac{v-c_y}{f_y}
+\frac{w_{pixel}}{f_x} = \frac{W_{real}}{D}
 $$
 
-再计算：
+移项得到：
 
 $$
-\mathbf{p}_c = \frac{r}{\sqrt{a^2+b^2+1}}
-\begin{bmatrix}a\\b\\1\end{bmatrix}
+\boxed{D = \frac{f_x W_{real}}{w_{pixel}} = \frac{k_w}{w_{pixel}}}
 $$
 
-单目 YOLO 只给出检测框和类别，不直接提供米制深度。若目标真实宽度 `W` 已知、目标平面近似正对相机，可用 `Zc ≈ fx × W / w_pixel` 估计光轴深度；物体倾斜、遮挡、检测框误差都会影响精度。原脚本中的 `distance` 只被读取和打印，没有参与坐标计算，因此该字段本身不能补齐像素到三维的过程。
+对于同一种固定尺寸的目标、同一套相机成像配置，`fx × W_real` 可以合并成常数 `k_w`。因此检测框宽度减半，估计距离就变成两倍。
 
-## 3. 第二步：相机坐标 → 机体坐标
-
-ROS 常用机体坐标约定为 **X 向前、Y 向左、Z 向上**，与相机光学坐标不同。
-
-通用转换公式是：
+如果使用检测框高度 `h_pixel`，同样的推导是：
 
 $$
-\mathbf{p}_b = R_{bc}\mathbf{p}_c + \mathbf{t}_{bc}
+\boxed{D = \frac{f_y H_{real}}{h_{pixel}} = \frac{k_h}{h_{pixel}}}
 $$
 
-其中 `Rbc` 将相机坐标表示的向量旋转到机体坐标，`tbc` 是相机光心在机体坐标系中的位置。
+这里 `k_h = fy × H_real`。**使用宽度还是高度，要与真实尺寸和标定系数对应。** 不能把宽度标定的系数直接用于高度，除非已经验证两者系数一致。
 
-只有在**相机朝前、没有安装倾角、光心与机体原点重合**时，才可使用下面的简化映射：
+仅有二维像素位置无法唯一确定距离。这种单目测距方法之所以可用，是因为额外引入了“目标真实尺寸固定”或“已通过实测标定系数”的约束。
 
-$$
-X_b=Z_c,\qquad Y_b=-X_c,\qquad Z_b=-Y_c
-$$
+### 3. 配套代码实际怎样计算？
 
-真实相机通常存在安装平移和俯仰角，需要使用标定外参，不能只交换轴或添加一个经验高度。参考脚本没有执行这一步，必须在构造 `box_x / box_y / box_z` 前完成。
-
-## 4. 第三步：机体坐标 → 世界坐标
-
-一般情况下，应使用机器人完整姿态：
-
-$$
-\mathbf{p}_w = R_{wb}\mathbf{p}_b + \mathbf{t}_{wb}
-$$
-
-组合相机外参后：
-
-$$
-\mathbf{p}_w = R_{wb}(R_{bc}\mathbf{p}_c+\mathbf{t}_{bc})+\mathbf{t}_{wb}
-$$
-
-参考脚本只使用里程计四元数中的偏航角 `yaw`，忽略 roll 和 pitch。因此其简化模型适用于姿态近似水平、输入轴向已经统一的情况。
-
-### 4.1 原脚本的实际公式
-
-`calculate_target_world_position()` 执行：
+`v888_drone_frame.py` 中的原始测距函数为：
 
 ```python
-world_x = drone_world_x + box_x * math.cos(yaw) - box_y * math.sin(yaw)
-world_y = drone_world_y + box_x * math.sin(yaw) + box_y * math.cos(yaw)
-world_z = drone_world_z - box_z
+def distance_ws(length):
+    k = 4000 / 2.86
+    distance = k / length
+    return distance
 ```
 
-这里 `yaw` 的单位为弧度，来自里程计姿态；消息中的 `yaw_angle`、`pitch_angle` 没有参与该计算。
+在检测结果循环中，它这样调用：
 
-**必须先确认 `box_z` 的正方向。** 原脚本使用减法：`box_z > 0` 会使目标世界高度降低。若上游输出的是标准机体坐标 `Zb`（向上为正），应在输入接口转换成 `box_z = -Zb`，或者在后续修改版本中统一改成标准机体坐标并使用完整旋转矩阵。不能把向上为正的 `Zb` 原样送入当前脚本。
+```python
+distance = distance_ws(x2 - x1)
+```
 
-为了与本文的标准机体坐标一致，后面的演示显式使用：
+逐步代入：
 
 ```text
-box_x = Xb
-box_y = Yb
-box_z = -Zb
+YOLO 输出检测框 (x1, y1, x2, y2)
+    ↓
+取框宽 w_pixel = x2 - x1
+    ↓
+计算固定系数 k = 4000 / 2.86 ≈ 1398.6014
+    ↓
+计算距离 distance = k / w_pixel
 ```
 
-这是演示的输入适配约定，并不表示原脚本已经校验了上游轴向。也不要把这个混合符号的三元组直接当作标准右手 TF 坐标系。
+因此，当前源码真正执行的公式是：
 
-### 4.2 世界原点和固定偏移
+$$
+\boxed{distance = \frac{4000}{2.86\,(x_2-x_1)}}
+$$
 
-里程计的 `pose` 应按消息的 `header.frame_id` 解释。原脚本直接复制位置和姿态，却把输出坐标系硬编码为 `world`；它没有执行 `odom → world` 的转换。因此只有上游里程计与该 `world` 代表同一个原点和轴向时，输出才成立。“起飞原点”是脚本的使用假设，代码没有自动记录或重置起飞原点。
+**当前使用的是宽度，`y2 - y1` 没有参与测距。** 后续代码在此距离基础上结合目标角度估计 `box_x / box_y / box_z`，再传给坐标转换节点。
 
-原始目标和最终目标还存在区别：
+源码没有说明 `4000` 与 `2.86` 各自来自哪次实验或哪项物理量，不能仅凭数字认定它们是焦距、真实尺寸或已知距离。能确定的是：它们的比值被当作固定测距系数；其单位和适用范围需要通过原始标定记录或实测确认。下游按米使用该结果，因此相应系数应按“米·像素”标定。
 
-```python
-final_x = world_x + 0.1
-final_y = world_y
-final_z = world_z + 1.3
-```
+### 4. 用一组二维框算一遍
 
-`0.1 m` 和 `1.3 m` 是原脚本的固定目标偏移，作用在**世界坐标轴**上，不会随机器人偏航旋转，也不是相机安装外参。
+设目标框为 `(100, 200, 300, 400)`，则宽度 `w_pixel = 300 - 100 = 200 px`。按原函数：
 
-## 5. 可运行的完整数值例子
+$$
+distance = \frac{4000/2.86}{200} \approx 6.993\ \text{m}
+$$
 
-下面只依赖 Python 标准库。假设相机已去畸变、朝前且光心与机体原点重合，机器人保持水平：
+| 框宽 w_pixel | 按源码系数得到的距离 | 变化规律 |
+| --- | --- | --- |
+| `100 px` | `13.986 m` | 宽度为 200 px 时的一半，距离为两倍 |
+| `200 px` | `6.993 m` | 本例 |
+| `400 px` | `3.497 m` | 宽度为 200 px 时的两倍，距离为一半 |
+
+以下例子可以独立运行。它保留原公式，并增加对无效框宽的检查：
 
 ```python
 import math
 
-# 目标像素、相机内参、沿光轴深度，数值仅用于演示。
-u, v = 440.0, 300.0
-fx, fy, cx, cy = 600.0, 600.0, 320.0, 240.0
-depth_m = 2.0
-if not math.isfinite(depth_m) or depth_m <= 0:
-    raise ValueError("深度必须是正的有限数，单位为米")
 
-# 像素 -> 相机光学坐标。
-xc = (u - cx) * depth_m / fx
-yc = (v - cy) * depth_m / fy
-zc = depth_m
+def estimate_distance(box, k=4000 / 2.86):
+    x1, y1, x2, y2 = box
+    width_pixel = x2 - x1
+    if not math.isfinite(width_pixel) or width_pixel <= 0:
+        raise ValueError("检测框宽度必须为正且有限")
+    if not math.isfinite(k) or k <= 0:
+        raise ValueError("测距系数必须为正且有限")
+    return k / width_pixel
 
-# 相机光学坐标 -> 标准机体坐标，仅适用本例安装假设。
-xb, yb, zb = zc, -xc, -yc
 
-# 适配原脚本：box_z 向下为正。
-box_x, box_y, box_z = xb, yb, -zb
-
-# 机器人世界位置和偏航角。
-drone_x, drone_y, drone_z = 1.0, 2.0, 1.5
-yaw = math.radians(90.0)
-world_x = drone_x + box_x * math.cos(yaw) - box_y * math.sin(yaw)
-world_y = drone_y + box_x * math.sin(yaw) + box_y * math.cos(yaw)
-world_z = drone_z - box_z
-goal = (world_x + 0.1, world_y, world_z + 1.3)
-
-print("相机坐标:", tuple(round(x, 3) for x in (xc, yc, zc)))
-print("机体坐标:", tuple(round(x, 3) for x in (xb, yb, zb)))
-print("世界坐标:", tuple(round(x, 3) for x in (world_x, world_y, world_z)))
-print("最终目标:", tuple(round(x, 3) for x in goal))
+for width in (100, 200, 400):
+    box = (100.0, 200.0, 100.0 + width, 400.0)
+    print(f"框宽 {width} px -> 距离 {estimate_distance(box):.3f} m")
 ```
 
 预期输出：
 
 ```text
-相机坐标: (0.4, 0.2, 2.0)
-机体坐标: (2.0, -0.4, -0.2)
-世界坐标: (1.4, 4.0, 1.3)
-最终目标: (1.5, 4.0, 2.6)
+框宽 100 px -> 距离 13.986 m
+框宽 200 px -> 距离 6.993 m
+框宽 400 px -> 距离 3.497 m
 ```
 
-## 6. 原脚本的 ROS 接口
+以上是对原公式的复现，不表示该系数已经适配你的相机和目标。例子中的输入检查也没有修改原始检测函数。
 
-面向 **ROS1 Noetic / Python3**，依赖 `rospy`、`tf`、`geometry_msgs`、`nav_msgs`、`std_msgs` 和 `numpy`。ROS2 需要移植节点及 TF 接口后才能运行。
+### 5. k 应该怎样标定？
 
-| 方向 | 话题 | 消息类型 | 用途 |
-| --- | --- | --- | --- |
-| 订阅 | `/yolov8_set_param` | `std_msgs/String` | 目标相对三维坐标及检测信息 |
-| 订阅 | `/mavros/local_position/odom` | `nav_msgs/Odometry` | 机器人位置和姿态 |
-| 发布 | `/move_base_simple/goal` | `geometry_msgs/PoseStamped` | 带固定偏移的目标，`frame_id=world` |
-| 广播 | `/tf` | TF 变换 | `world` 下的目标与机器人坐标系 |
+最直接的办法是用已知距离与对应的框尺寸求乘积：
 
-`String.data` 的格式是逗号分隔的 `key:value`，不是 JSON：
+$$
+k_w = D_{ref}\,w_{ref},\qquad
+k_h = D_{ref}\,h_{ref}
+$$
+
+例如，在与实际运行相同的相机分辨率和检测坐标尺度下，测得某固定目标距离为 `5.0 m`，框宽为 `280 px`：
 
 ```text
-center_x:440,center_y:300,frame_name:gate,distance:2.04939,yaw_angle:11.30993,pitch_angle:-5.71059,box_x:2.0,box_y:-0.4,box_z:0.2
+k_w = 5.0 × 280 = 1400 m·px
+新一帧框宽为 200 px 时，D = 1400 / 200 = 7.0 m
 ```
 
-其中 `distance` 和角度字段仅作为检测元数据存储、打印。本例的角度分别表示像素相对光轴的水平/垂直角，不是机体的姿态。真正参与目标位置计算的是 `box_x / box_y / box_z` 与里程计。
+这组数字是演示标定过程的新例子，不是源码常数 `4000 / 2.86` 的来源。标定时应先定义测量的是光轴深度还是相机到目标的斜距；若沿光轴正前方标定，两者在该位置一致。
 
-| TF 子坐标系 | 含义 |
+实际操作建议：
+
+1. 固定目标的真实尺寸、相机分辨率、镜头焦距及检测坐标尺度，使目标近似正对相机。
+2. 在多个已知距离采样，记录每组 `D_ref` 和 `w_ref`，得到多个 `k_i = D_ref × w_ref`。
+3. 可取这些 `k_i` 的中位数作为初值，再用未参与标定的距离验证误差；若系数随距离或姿态明显变化，需检查模型假设。
+4. 不同类别若真实宽度不同，应分别标定系数。共享同一个 `k` 不能自动消除目标尺寸差异。
+
+### 6. 哪些因素会让距离算错？
+
+| 因素 | 对结果的影响 |
 | --- | --- |
-| `target_original` | 原始目标的世界坐标，单位四元数 |
-| `target_final` | 叠加固定偏移后的世界坐标，单位四元数 |
-| `drone_current` | 机器人位置和仅包含 yaw 的姿态 |
-| `target_<序号>_<frame_name>` | 按类别名称存储的历史目标位置 |
+| 同类别目标真实大小不同 | 同样的框宽可能对应不同距离，固定系数无法区分 |
+| 目标倾斜或部分遮挡 | 框宽与完整目标真实宽度不再对应，常会使距离估计偏大 |
+| 框坐标被缩放 | 若宽度变成原来的 `s` 倍，系数也需变成 `s × k`，或先还原框坐标 |
+| 检测框抖动 | `D = k / w`，小框对像素误差更敏感；例如 20 px 的框误差 2 px，可能带来约 10% 的距离误差 |
+| 框宽为 0 或负值 | 原函数没有检查，会出现除零或无意义结果；需在上游过滤 |
+| 镜头畸变或变焦 | 尺寸投影与标定条件发生变化，需去畸变或重新标定 |
 
-目标 TF 的姿态是单位四元数，而发布的 `PoseStamped` 朝向跟随机器人当前 yaw，两者的方向信息不同。相同 `frame_name` 会覆盖旧位置，不是逐帧累积独立目标。
+配套代码先将检测框转成整数，再使用 `x2 - x1`，很小的框还可能受到取整误差影响。源码用同一系数选择 `distance` 最小的目标，实际等价于选框最宽的目标；只有目标真实宽度可比时，这才近似代表最近的目标。
 
-## 7. 在独立 ROS Master 中演示
+### 7. 测得距离以后，才进入三维计算
 
-以下命令使用独立端口，并将目标输出重映射到 `/tutorial/goal`，适合先验证数值和 RViz 可视化。它们不会启动 MAVROS、检测器或导航控制器。
-
-先下载仓库并进入项目根目录。在下面每个新终端中，先执行：
-
-```bash
-source /opt/ros/noetic/setup.bash
-export ROS_MASTER_URI=http://127.0.0.1:11321
-export ROS_IP=127.0.0.1
+```mermaid
+flowchart TD
+    A["二维检测框 x1, y1, x2, y2"] --> B["像素宽度 w = x2 - x1"]
+    C["真实尺寸或实测标定系数 k"] --> D["估算距离 D = k / w"]
+    B --> D
+    A --> E["框中心 u, v：确定视线方向"]
+    D --> F["结合相机模型得到相对三维位置"]
+    E --> F
+    F --> G["tf_fransform_frame.py：转换到世界坐标"]
 ```
 
-**终端 A：启动 Master。**
+在理想尺寸模型中，估计的 `D` 对应光轴深度 `Zc`。已知中心 `(u, v)` 后，可计算 `Xc = (u-cx) × D / fx`、`Yc = (v-cy) × D / fy`、`Zc = D`。
 
-```bash
-roscore -p 11321
-```
+配套检测代码会把 `distance` 送入三角函数计算相对坐标，相当于将其当成视线方向的距离使用；不能仅因变量名叫 `distance` 就认定它与光轴深度或直线距离完全一致。若按宽度模型得到的是光轴深度，离轴目标需先按下文相机模型计算坐标，不能直接拿该深度当斜距。其目标角度与相机外参也需分别核对。
 
-**终端 B：在项目根目录启动原脚本。**
+## 继续阅读与仓库内容
 
-```bash
-/usr/bin/python3 reference/tf_fransform_frame.py \
-  /move_base_simple/goal:=/tutorial/goal
-```
-
-**终端 C：持续提供演示里程计。** 世界位置为 `(1, 2, 1.5)`，四元数对应 yaw 为 90°；四元数顺序为 `x, y, z, w`。
-
-```bash
-rostopic pub -r 10 /mavros/local_position/odom nav_msgs/Odometry \
-  '{header: {frame_id: world}, child_frame_id: base_link, pose: {pose: {position: {x: 1.0, y: 2.0, z: 1.5}, orientation: {x: 0.0, y: 0.0, z: 0.7071067811865476, w: 0.7071067811865476}}}}'
-```
-
-**终端 D：先监听目标输出。**
-
-```bash
-rostopic echo -n 1 /tutorial/goal
-```
-
-**终端 E：确认节点已收到里程计后，发送检测结果。**
-
-```bash
-rostopic pub -1 /yolov8_set_param std_msgs/String \
-  '{data: "center_x:440,center_y:300,frame_name:gate,distance:2.04939,yaw_angle:11.30993,pitch_angle:-5.71059,box_x:2.0,box_y:-0.4,box_z:0.2"}'
-```
-
-目标输出应为 `frame_id: world`，位置约 `(1.5, 4.0, 2.6)`，姿态约 `(0, 0, 0.707107, 0.707107)`。启动后首次发布可能等待至多约 8 秒，这是原脚本的发布节流逻辑。
-
-可在另一个已配置环境的终端查看：
-
-```bash
-rosrun tf tf_echo world target_original
-rosrun tf tf_echo world target_final
-```
-
-分别应得到约 `(1.4, 4.0, 1.3)` 和 `(1.5, 4.0, 2.6)`。RViz 的 Fixed Frame 设为 `world`，添加 TF 显示即可观察；演示结束后用 `Ctrl+C` 停止各终端。
-
-话题名称中的 `move_base` 不代表已经具备无人机三维导航能力。原脚本只发布一个 `PoseStamped`；具体控制器是否支持 Z 轴、是否消费该话题，取决于下游实现。
-
-## 8. 接入真实数据时的边界
-
-| 检查项 | 原脚本行为及影响 |
-| --- | --- |
-| 高度符号 | `world_z = drone_z - box_z`，上游若采用向上为正，需要先适配 |
-| 完整姿态 | 只使用 yaw；明显倾斜时，使用完整四元数对应的旋转矩阵 |
-| 相机外参 | 未计算，需由上游补齐安装旋转和平移 |
-| 参考坐标系 | 未读取、校验或变换里程计的 `header.frame_id`，输出固定标记为 `world` |
-| 时间同步 | 使用最新保存的里程计，检测字符串没有时间戳；运动时可能错配 |
-| 尚未收到里程计 | 直接返回相对坐标作为世界坐标，而非拒绝该目标；`has_odom` 也不会检查位姿是否过期 |
-| 字段校验 | 缺少数值字段时默认填 0，没有拒绝 NaN、Inf 或不合理深度 |
-| 目标偏移 | 固定叠加世界 X 方向 `0.1 m`、Z 方向 `1.3 m`，不是通用参数 |
-| 发布间隔 | 目标发布由回调和一次性定时器节流，间隔意图为 8 秒；TF 主循环约 10 Hz |
-| 定时器与并发 | 延迟发布时读取当前共享目标；多次检测可能覆盖待发布目标，线程间没有加锁，严格频率和一致快照需要另行处理 |
-| 初始 TF | 启动后即广播零值目标及带偏移目标，并不表示已完成有效检测 |
-| 目标身份 | 字典按 `frame_name` 覆盖，不能区分同类别的多个实例；名称也未进行 TF 标识符清理 |
-
-以上是参考代码的实际边界，本仓库保留原实现，未将这些行为描述为已经修复。更通用的实现应统一使用右手坐标系，携带时间戳和 frame ID，并通过 TF 查询检测时刻的完整外参及位姿。
-
-## 9. 仓库内容与参考资料
+- [三维坐标转换与 ROS TF 演示](docs/coordinate-transforms.md)：相机模型、机体与世界坐标转换、原脚本的输入输出和已验证的 ROS 示例。
+- [原始参考脚本 tf_fransform_frame.py](reference/tf_fransform_frame.py)：保留原实现，便于对照世界坐标计算。
 
 ```text
 pixel-to-world-3d/
-├── README.md                         # 原理、公式、数值例子和 ROS 演示
+├── README.md                         # 二维框测距公式、系数标定与误差
+├── docs/
+│   └── coordinate-transforms.md       # 三维坐标转换与 ROS 演示
 └── reference/
-    └── tf_fransform_frame.py          # 原始参考脚本，保留原文件名与实现
+    └── tf_fransform_frame.py          # 原始世界坐标转换脚本
 ```
 
-原脚本 SHA-256：`0215c7652c5e730670e2f4d5256eb7d20c7293250547c87e2d1be9ffab6f558f`。
-
-- [ROS REP-103：单位与坐标轴约定](https://www.ros.org/reps/rep-0103.html)
-- [sensor_msgs/CameraInfo：光学坐标、内参、畸变及校正投影](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/CameraInfo.html)
-- [nav_msgs/Odometry：pose 与 twist 的参考坐标系](https://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html)
-- [geometry_msgs/PoseStamped：带时间戳和参考坐标系的位姿](https://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/PoseStamped.html)
-- [ROS tf：坐标变换库](https://wiki.ros.org/tf)
+相机投影公式可参考 [ROS CameraInfo 消息定义](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/CameraInfo.html)。本文区分配套源码的实际算法和用于解释原理的标定示例，未将示例系数当作设备实测结果。
